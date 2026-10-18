@@ -1345,9 +1345,11 @@ FocusScope {
           }
         }
 
-        RowLayout {
+        GridLayout {
           Layout.fillWidth: true
-          spacing: Style.space(8)
+          columns: root.width < Style.space(460) ? 1 : 3
+          columnSpacing: Style.space(8)
+          rowSpacing: Style.space(8)
 
           TextField {
             id: profileNameField

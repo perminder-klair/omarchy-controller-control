@@ -108,6 +108,7 @@ ShellRoot {
     property var action: null
     property var description: null
     property real savedScroll: 0
+    property real profileWindowWidth: 0
     function check(ok, message) { if (!ok) throw new Error(message) }
     function find(item, predicate) {
       if (predicate(item)) return item
@@ -471,7 +472,12 @@ ShellRoot {
           fake.running = false
           check(!editor.pointerSaved.enabled && !editor.pointerDirty, "Pointer starts disabled with stable saved assignments")
           panel.openWindow()
+          profileWindowWidth = editor.Window.window.width
+          editor.Window.window.width = 320
         } else if (stage === 21) {
+          check(control("profileNameField").visible && control("profileNameField").width >= Style.space(120),
+                "Profile name remains usable at the minimum window width: " + control("profileNameField").width)
+          editor.Window.window.width = profileWindowWidth
           fake.savedPointer = {enabled:false, buttons:{A:"left",X:"left",B:"right"}}
           configurePointer()
           check(editor.pointerDirty && editor.pointerRevision === 0, "Editing shared controls does not write settings")
