@@ -2,27 +2,34 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Controller indicator for the bar.
 //
 // Solid glyph when a pad is connected, dimmed when not. It pulses briefly
 // whenever a binding fires, which doubles as the "is this thing working?"
-// answer without opening anything. Left click opens the bindings panel.
+// answer without opening anything, and pulses red when one fails. Left click
+// opens the bindings panel.
 BarWidget {
   id: root
   moduleName: "co.klair.controller-control"
 
-  readonly property var service: bar?.shell?.serviceFor("co.klair.controller-control")
+  // `bar` arrives after creation, and a Connections target must never be
+  // undefined, so this settles on null until then.
+  readonly property var service: bar?.shell?.serviceFor("co.klair.controller-control") ?? null
+  readonly property bool running: service ? service.running === true : false
   readonly property bool connected: service ? service.connected === true : false
-  readonly property bool enabled: service ? service.enabled === true : true
+  readonly property bool switchedOn: service ? service.switchedOn === true : true
   readonly property string deviceName: service ? service.deviceName : ""
   readonly property int bindingCount: service ? service.bindingCount : 0
+  readonly property string lastError: service ? service.lastError : ""
   readonly property bool hideWhenDisconnected: setting("hideWhenDisconnected", false)
 
   readonly property string glyph: "󰊴"
 
   property bool flashing: false
+  property bool flashFailed: false
 
   visible: connected || !hideWhenDisconnected
   implicitWidth: button.implicitWidth
@@ -56,6 +63,12 @@ BarWidget {
     target: root.service
     enabled: root.service !== null
     function onFired(label, description) {
+      root.flashFailed = false
+      root.flashing = true
+      flashTimer.restart()
+    }
+    function onFireFailed(label, detail) {
+      root.flashFailed = true
       root.flashing = true
       flashTimer.restart()
     }
@@ -87,24 +100,27 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: root.glyph
-    tooltipText: root.connected
-      ? (root.enabled
-          ? root.deviceName + " — " + root.bindingCount + " bindings"
-          : root.deviceName + " — disabled")
-      : "No controller connected"
+    tooltipText: {
+      var status = !root.running
+        ? "Controller Control is not running"
+        : (!root.connected
+            ? "No controller connected"
+            : root.deviceName + " — " + (root.switchedOn ? root.bindingCount + " bindings" : "disabled"))
+      return root.lastError !== "" ? status + "\n" + root.lastError : status
+    }
 
     // Dim rather than hide when nothing is paired, so the widget still says
     // "the pad is off" instead of silently vanishing.
-    readonly property color baseForeground: root.bar ? root.bar.barForeground : Color.foreground
+    readonly property color baseForeground: root.bar ? root.bar.barForeground : Commons.Color.foreground
     // Three states worth telling apart at a glance: working, connected but
     // switched off, and nothing paired at all.
     foreground: !root.connected
       ? Qt.darker(baseForeground, 2.0)
-      : (root.enabled ? baseForeground : Qt.darker(baseForeground, 1.7))
+      : (root.switchedOn ? baseForeground : Qt.darker(baseForeground, 1.7))
 
     // The pulse on each fired binding.
     active: root.flashing
-    activeColor: Color.accent
+    activeColor: root.flashFailed ? Commons.Color.urgent : Commons.Color.accent
 
     onPressed: function (b) {
       // Middle click is the quickest way to silence the pad without

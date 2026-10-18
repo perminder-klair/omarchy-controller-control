@@ -18,41 +18,55 @@ Item {
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
   readonly property string cli: pluginDir + "bin/controller-control"
 
+  // Linux signal numbers, for Process.signal().
+  readonly property int sigHup: 1
+  readonly property int sigUsr1: 10
+  readonly property int sigUsr2: 12
+
   // ---- live state, read by BarWidget.qml and Panel.qml -------------------
 
   property bool running: false
   property bool connected: false
-  // Master switch, persisted in the config file.
-  property bool enabled: true
+  // Master switch, persisted in the config file. Not called `enabled`, which
+  // would override Item's own property of that name.
+  property bool switchedOn: true
   // Transient mute, held only while the panel is recording a combo.
   property bool paused: false
   property string deviceName: ""
-  property string devicePath: ""
   property bool exclusive: false
   property int bindingCount: 0
-  property int daemonPid: 0
   property string lastError: ""
+  readonly property bool enableBusy: enableProc.running
+  property bool _enabledBefore: true
+
+  // The full binding list, as the daemon last loaded it.
+  property var bindings: []
+  property string layout: "auto"
+  // Tokens labelled differently under the current layout (Nintendo faces).
+  property var labelOverrides: ({})
 
   // Buttons physically held right now, as canonical tokens.
   property var heldButtons: []
-  // Most recent binding that fired, for the widget's flash and the panel log.
-  property string lastFired: ""
-  property string lastFiredLabel: ""
-  property real lastFiredAt: 0
+
+  function labelFor(token) {
+    return root.labelOverrides[token] || token
+  }
+
+  function comboLabel(combo) {
+    return combo.map(root.labelFor).join(" + ")
+  }
 
   // ---- combo capture ("press the combo you want to bind") ---------------
 
   property bool capturing: false
-  property var capturedCombo: []
   property var _capturePeak: []
 
   signal comboCaptured(var combo)
   signal fired(string label, string description)
-  signal suppressed(string label, string reason)
+  signal fireFailed(string label, string detail)
 
   function startCapture() {
     root._capturePeak = []
-    root.capturedCombo = []
     root.capturing = true
     // Mute firing first: the buttons you are about to press are quite likely
     // the ones you are rebinding, and recording a combo should not also run
@@ -61,32 +75,43 @@ Item {
   }
 
   function cancelCapture() {
+    if (!root.capturing) return
     root.capturing = false
     root._capturePeak = []
     root.resumeFiring()
   }
 
+  // ---- signalling the daemon --------------------------------------------
+
+  // True once the daemon has said "started". Before that its signal handlers
+  // may not exist yet, and SIGUSR1's default action would kill it.
+  property bool ready: false
+  property bool _wantPaused: false
+
   function pauseFiring() {
-    if (root.daemonPid > 0) {
-      pauseProc.command = ["kill", "-USR1", String(root.daemonPid)]
-      pauseProc.running = true
-    }
+    root._wantPaused = true
+    if (root.ready) daemon.signal(root.sigUsr1)
   }
 
   function resumeFiring() {
-    if (root.daemonPid > 0) {
-      resumeProc.command = ["kill", "-USR2", String(root.daemonPid)]
-      resumeProc.running = true
-    }
+    root._wantPaused = false
+    if (root.ready) daemon.signal(root.sigUsr2)
   }
 
   function setEnabled(value) {
+    if (enableProc.running) return
+    // Show the change at once; the daemon's next state event confirms it,
+    // and a failed command puts it back.
+    root._enabledBefore = root.switchedOn
+    root.switchedOn = value
+    // `enable`/`disable` rewrite the config and signal the daemon
+    // themselves, so there is nothing to reload afterwards.
     enableProc.command = [root.cli, value ? "enable" : "disable"]
     enableProc.running = true
   }
 
   function toggleEnabled() {
-    root.setEnabled(!root.enabled)
+    root.setEnabled(!root.switchedOn)
   }
 
   function _captureButton(button, pressed, held) {
@@ -96,42 +121,55 @@ Item {
       if (held.length >= root._capturePeak.length) root._capturePeak = held.slice()
       return
     }
-    if (held.length === 0 && root._capturePeak.length > 0) {
-      var combo = root._capturePeak.slice().sort()
-      root.capturing = false
-      root.capturedCombo = combo
-      root._capturePeak = []
-      root.resumeFiring()
-      root.comboCaptured(combo)
-    }
+    if (held.length > 0 || root._capturePeak.length === 0) return
+    var combo = root._capturePeak.slice().sort()
+    root.capturing = false
+    root._capturePeak = []
+    root.resumeFiring()
+    root.comboCaptured(combo)
   }
 
   // ---- daemon control ---------------------------------------------------
 
+  // Restarts back off from 3s to a minute, so a daemon that cannot start
+  // (a broken config, say) is not respawned every few seconds forever.
+  readonly property int restartFloorMs: 3000
+  readonly property int restartCeilingMs: 60000
+  property int _restartDelay: restartFloorMs
+  property bool _wanted: false
+  property bool _quickRestart: false
+  property double _startedAt: 0
+
   function start() {
+    root._wanted = true
     if (daemon.running) return
-    root.lastError = ""
+    root._startedAt = Date.now()
     daemon.running = true
   }
 
   function stop() {
+    root._wanted = false
+    restartTimer.stop()
     daemon.running = false
   }
 
   function restart() {
-    stop()
-    restartTimer.restart()
+    root._restartDelay = root.restartFloorMs
+    if (daemon.running) {
+      // onExited brings it back.
+      root._wanted = true
+      root._quickRestart = true
+      daemon.running = false
+    } else {
+      root.start()
+    }
   }
 
   // The daemon re-reads its config on SIGHUP, which is cheaper and less
   // disruptive than bouncing the process (no re-grab of the pad).
   function reload() {
-    if (root.daemonPid > 0) {
-      reloadProc.command = ["kill", "-HUP", String(root.daemonPid)]
-      reloadProc.running = true
-    } else {
-      restart()
-    }
+    if (root.ready) daemon.signal(root.sigHup)
+    else root.restart()
   }
 
   function _handle(line) {
@@ -146,66 +184,67 @@ Item {
     switch (event.event) {
     case "started":
       root.running = true
-      root.daemonPid = Number(event.pid) || 0
-      if (event.enabled !== undefined) root.enabled = event.enabled === true
+      root.ready = true
+      root.lastError = ""
+      if (event.enabled !== undefined) root.switchedOn = event.enabled === true
+      if (root._wantPaused) daemon.signal(root.sigUsr1)
       break
     case "state":
       root.connected = event.connected === true
       root.bindingCount = Number(event.bindings) || 0
       root.exclusive = event.exclusive === true
-      if (event.enabled !== undefined) root.enabled = event.enabled === true
+      if (event.enabled !== undefined && !enableProc.running) root.switchedOn = event.enabled === true
       if (event.paused !== undefined) root.paused = event.paused === true
-      if (Array.isArray(event.devices) && event.devices.length > 0) {
+      if (Array.isArray(event.devices) && event.devices.length > 0)
         root.deviceName = String(event.devices[0].name || "")
-        root.devicePath = String(event.devices[0].path || "")
-      } else {
+      else
         root.deviceName = ""
-        root.devicePath = ""
-      }
       break
     case "connected":
       root.connected = true
       root.deviceName = String(event.name || "")
-      root.devicePath = String(event.path || "")
       break
     case "disconnected":
-      root.connected = false
-      root.deviceName = ""
-      root.devicePath = ""
-      root.heldButtons = []
+      root.heldButtons = Array.isArray(event.held) ? event.held : []
+      break
+    case "bindings":
+      root.bindings = Array.isArray(event.bindings) ? event.bindings : []
+      root.layout = String(event.layout || "auto")
+      root.labelOverrides = event.labels || {}
       break
     case "button":
-      var held = Array.isArray(event.held) ? event.held : []
-      root.heldButtons = held
-      root._captureButton(String(event.button || ""), event.pressed === true, held)
+      root.heldButtons = Array.isArray(event.held) ? event.held : []
+      root._captureButton(String(event.button || ""), event.pressed === true, root.heldButtons)
       break
     case "fire":
-      root.lastFired = String(event.label || "")
-      root.lastFiredLabel = String(event.description || event.action || "")
-      root.lastFiredAt = Date.now()
-      root.fired(root.lastFired, root.lastFiredLabel)
+      if (event.ok === false) {
+        root.lastError = String(event.label || "") + ": " + String(event.detail || "failed")
+        root.fireFailed(String(event.label || ""), String(event.detail || ""))
+      } else {
+        root.fired(String(event.label || ""), String(event.description || event.action || ""))
+      }
       break
     case "reloaded":
+      root.lastError = ""
       root.bindingCount = Number(event.bindings) || 0
-      if (event.enabled !== undefined) root.enabled = event.enabled === true
-      break
-    case "suppressed":
-      // Authoritative paused/enabled state arrives on "state" events; this
-      // one only reports that a combo was recognised and swallowed.
-      root.suppressed(String(event.label || ""), String(event.reason || ""))
+      if (event.enabled !== undefined && !enableProc.running) root.switchedOn = event.enabled === true
       break
     case "error":
       root.lastError = String(event.message || "")
       break
     case "stopped":
       root.running = false
+      root.ready = false
       break
     }
   }
 
   Process {
     id: daemon
-    command: [root.cli, "daemon"]
+    // The daemon leaves when this pipe closes, so a crashed shell cannot
+    // leave it running beside the one the next shell starts.
+    command: [root.cli, "daemon", "--exit-with-stdin"]
+    stdinEnabled: true
     running: false
 
     stdout: SplitParser {
@@ -219,30 +258,42 @@ Item {
 
     onExited: function (exitCode, exitStatus) {
       root.running = false
+      root.ready = false
       root.connected = false
-      root.daemonPid = 0
       root.heldButtons = []
       if (exitCode !== 0 && root.lastError === "")
         root.lastError = "daemon exited with code " + exitCode
-      // Come back up on its own; a crashed daemon means a dead controller.
+      if (!root._wanted) return
+      if (root._quickRestart) {
+        root._quickRestart = false
+        restartTimer.interval = 300
+      } else {
+        // 127 is the launcher finding no python3; retrying will not help.
+        if (exitCode === 127) return
+        // A run that lasted a while was healthy; start the backoff over.
+        if (Date.now() - root._startedAt > 30000) root._restartDelay = root.restartFloorMs
+        restartTimer.interval = root._restartDelay
+        root._restartDelay = Math.min(root._restartDelay * 2, root.restartCeilingMs)
+      }
       restartTimer.restart()
     }
   }
 
-  Process { id: reloadProc }
-  Process { id: pauseProc }
-  Process { id: resumeProc }
-
   Process {
     id: enableProc
-    // `enable`/`disable` rewrite the config and signal the daemon themselves,
-    // so there is nothing to reload afterwards.
-    onExited: function () { root.reload() }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") root.lastError = text.trim()
+      }
+    }
+    onExited: function (exitCode) {
+      if (exitCode !== 0) root.switchedOn = root._enabledBefore
+    }
   }
 
   Timer {
     id: restartTimer
-    interval: 3000
     repeat: false
     onTriggered: root.start()
   }
@@ -254,7 +305,7 @@ Item {
       return JSON.stringify({
         running: root.running,
         connected: root.connected,
-        enabled: root.enabled,
+        enabled: root.switchedOn,
         paused: root.paused,
         device: root.deviceName,
         bindings: root.bindingCount,
@@ -286,7 +337,7 @@ Item {
 
     function toggle(): string {
       root.toggleEnabled()
-      return root.enabled ? "disabling" : "enabling"
+      return root.switchedOn ? "enabling" : "disabling"
     }
   }
 
