@@ -8,13 +8,18 @@ import os
 from . import linux_input as li
 from ._codes import ABS_CODES
 from .buttons import (
+    CODE_TO_BUTTON,
     HAT_AXES,
     STICK_AXES,
     TRIGGER_AXES,
     button_for_key_code,
 )
+from .keys import VirtualKeyboard
 
 _ABS_NAMES = {code: name for name, code in ABS_CODES.items()}
+
+# KEY_Q..KEY_P, KEY_A..KEY_L and KEY_Z..KEY_M: the letter rows of a keyboard.
+_LETTER_KEYS = frozenset([*range(16, 26), *range(30, 39), *range(44, 51)])
 
 
 class DeviceGone(Exception):
@@ -53,7 +58,13 @@ class DeviceInfo:
 
     @property
     def is_gamepad(self) -> bool:
-        return bool(self.pad_buttons)
+        if not self.pad_buttons:
+            return False
+        # Virtual keyboards from remote-desktop and input tools often claim
+        # every key code there is, joystick buttons included. A real pad has
+        # axes; a device with the letter rows and no axes is a keyboard.
+        has_letters = len(_LETTER_KEYS.intersection(self.key_codes)) == len(_LETTER_KEYS)
+        return bool(self.abs_codes) or not has_letters
 
     @property
     def is_keyboard(self) -> bool:
@@ -61,8 +72,22 @@ class DeviceInfo:
         return not self.is_gamepad and any(2 <= c <= 60 for c in self.key_codes)
 
     @property
+    def is_own_keyboard(self) -> bool:
+        """The virtual keyboard this program types `keys` actions on."""
+        return (self.vendor, self.product) == (VirtualKeyboard.VENDOR, VirtualKeyboard.PRODUCT)
+
+    @property
     def button_tokens(self) -> list[str]:
-        return [button_for_key_code(c) for c in self.pad_buttons]
+        if not self.is_gamepad:
+            return []
+        # Pad-range buttons, plus named buttons outside that range (a
+        # dedicated Back reports BTN_BACK, which sits among the mouse buttons).
+        pad = set(self.pad_buttons)
+        return [
+            button_for_key_code(c)
+            for c in self.key_codes
+            if c in pad or c in CODE_TO_BUTTON
+        ]
 
     @property
     def axis_names(self) -> list[str]:
@@ -101,8 +126,11 @@ class DeviceScanner:
     caches the inspection per device node and only pays the open() cost for
     nodes it has not seen before.
 
-    The cache key includes the node's identity and mtime, so a node that is
-    destroyed and recreated is re-inspected rather than served from cache.
+    The cache key includes the node's identity, mtime and ctime, so a node
+    that is destroyed and recreated is re-inspected rather than served from
+    cache. ctime matters for hotplug: a new node appears root-only and udev
+    grants access a moment later, which changes only the ctime. Without it a
+    scan in that moment would remember the node as unreadable for good.
     """
 
     def __init__(self) -> None:
@@ -114,7 +142,7 @@ class DeviceScanner:
             st = os.stat(path)
         except OSError:
             return None
-        return (st.st_ino, st.st_rdev, st.st_mtime_ns)
+        return (st.st_ino, st.st_rdev, st.st_mtime_ns, st.st_ctime_ns)
 
     def inspect(self, path: str) -> DeviceInfo | None:
         stamp = self._stamp(path)
@@ -165,7 +193,8 @@ class DeviceScanner:
         """
         devices = []
         for info in self.scan():
-            if not info.matches(patterns):
+            # Never our own output: grabbing it would swallow every key we type.
+            if info.is_own_keyboard or not info.matches(patterns):
                 continue
             if info.is_gamepad or (allow_keyboard and patterns and info.is_keyboard):
                 devices.append(info)
@@ -195,15 +224,30 @@ class Gamepad:
         self.info = info
         self.path = info.path
         self.name = info.name
+        # Which inputs hold each token, as (event type, code). Two inputs can
+        # produce one token -- an analog trigger and its digital button, or a
+        # hat and a stick aliased onto the d-pad -- and the token stays held
+        # until both let go.
+        self._holders: dict[str, set[tuple[int, int]]] = {}
+        self.apply(settings, aliases)
+        self.fd = li.open_event_device(info.path)
+        self.grabbed = li.grab(self.fd, True) if exclusive else False
+        # Axis tokens currently considered "pressed", keyed by axis code.
+        self._axis_state: dict[int, set[str]] = {}
+        # Key codes reported down, to compare against the real state after
+        # the kernel drops events.
+        self._keys_down: set[int] = set()
+        self._resyncing = False
+
+    def apply(self, settings: dict, aliases: dict | None = None) -> None:
+        """Take new settings and aliases without reopening the device."""
         # Applied to every token before anything else sees it, so bindings,
         # capture and the UI all speak the same names.
         self.aliases = dict(aliases or {})
         self.trigger_threshold = float(settings.get("trigger_threshold", 0.45))
         self.stick_threshold = float(settings.get("stick_threshold", 0.65))
-        self.fd = li.open_event_device(info.path)
-        self.grabbed = li.grab(self.fd, True) if exclusive else False
-        # Axis tokens currently considered "pressed", keyed by axis code.
-        self._axis_state: dict[int, set[str]] = {}
+        # Tokens may now be named differently; the daemon starts over too.
+        self._holders.clear()
 
     def fileno(self) -> int:
         return self.fd
@@ -218,7 +262,7 @@ class Gamepad:
         finally:
             self.fd = -1
 
-    # -- axis decoding ------------------------------------------------------
+    # -- decoding -----------------------------------------------------------
 
     def _hat_tokens(self, code: int, value: int) -> set[str]:
         negative, positive = HAT_AXES[code]
@@ -248,7 +292,7 @@ class Gamepad:
             return {positive}
         return set()
 
-    def _decode_abs(self, code: int, value: int) -> list[tuple[str, bool]]:
+    def _decode_abs(self, code: int, value: int) -> list[tuple[tuple, str, bool]]:
         if code in HAT_AXES:
             active = self._hat_tokens(code, value)
         elif code in TRIGGER_AXES:
@@ -262,18 +306,57 @@ class Gamepad:
         if active == previous:
             return []
         self._axis_state[code] = active
-        events = [(token, False) for token in sorted(previous - active)]
-        events += [(token, True) for token in sorted(active - previous)]
+        source = (li.EV_ABS, code)
+        events = [(source, token, False) for token in sorted(previous - active)]
+        events += [(source, token, True) for token in sorted(active - previous)]
         return events
+
+    def _decode_key(self, code: int, pressed: bool) -> list[tuple[tuple, str, bool]]:
+        if pressed:
+            self._keys_down.add(code)
+        else:
+            self._keys_down.discard(code)
+        return [((li.EV_KEY, code), button_for_key_code(code), pressed)]
+
+    def _resync(self) -> list[tuple[tuple, str, bool]]:
+        """Bring our idea of what is held in line with the device's real state."""
+        changes: list[tuple[tuple, str, bool]] = []
+        state = li.read_key_state(self.fd)
+        if state:
+            down = {c for c in self.info.key_codes if li.bit_is_set(state, c)}
+            for code in sorted(self._keys_down - down):
+                changes.extend(self._decode_key(code, False))
+            for code in sorted(down - self._keys_down):
+                changes.extend(self._decode_key(code, True))
+        for code in self.info.abs_codes:
+            if code in HAT_AXES or code in TRIGGER_AXES or code in STICK_AXES:
+                info = li.read_abs_info(self.fd, code)
+                if info is not None:
+                    changes.extend(self._decode_abs(code, info["value"]))
+        return changes
+
+    def _track(self, source: tuple, token: str, pressed: bool) -> bool:
+        """Record one input changing. True when it changes whether `token` is held."""
+        holders = self._holders.get(token)
+        if pressed:
+            if holders:
+                holders.add(source)
+                return False
+            self._holders[token] = {source}
+            return True
+        if not holders or source not in holders:
+            return False
+        holders.discard(source)
+        if holders:
+            return False
+        del self._holders[token]
+        return True
 
     # -- reading ------------------------------------------------------------
 
-    def _alias(self, token: str) -> str:
-        return self.aliases.get(token, token)
-
     def read(self) -> list[tuple[str, bool]]:
         """Drain pending events. Returns (button_token, pressed) pairs."""
-        events: list[tuple[str, bool]] = []
+        changes: list[tuple[tuple, str, bool]] = []
         while True:
             try:
                 data = os.read(self.fd, li.EVENT_SIZE * 64)
@@ -290,15 +373,31 @@ class Gamepad:
 
             for offset in range(0, len(data) - li.EVENT_SIZE + 1, li.EVENT_SIZE):
                 _sec, _usec, ev_type, code, value = li.unpack_event(data, offset)
+                if ev_type == li.EV_SYN:
+                    if code == li.SYN_DROPPED:
+                        # Our buffer overflowed and events were lost, perhaps
+                        # a release. Skip to the next report, then read the
+                        # real state, so no button is left stuck down.
+                        self._resyncing = True
+                    elif code == li.SYN_REPORT and self._resyncing:
+                        self._resyncing = False
+                        changes.extend(self._resync())
+                    continue
+                if self._resyncing:
+                    continue
                 if ev_type == li.EV_KEY:
                     if value == 2:  # kernel autorepeat; our own repeat handles it
                         continue
-                    events.append((button_for_key_code(code), value == 1))
+                    changes.extend(self._decode_key(code, value == 1))
                 elif ev_type == li.EV_ABS:
-                    events.extend(self._decode_abs(code, value))
+                    changes.extend(self._decode_abs(code, value))
 
             if len(data) < li.EVENT_SIZE * 64:
                 break
-        if self.aliases:
-            events = [(self._alias(token), pressed) for token, pressed in events]
+
+        events: list[tuple[str, bool]] = []
+        for source, token, pressed in changes:
+            token = self.aliases.get(token, token)
+            if self._track(source, token, pressed):
+                events.append((token, pressed))
         return events

@@ -15,9 +15,9 @@ import sys
 import time
 
 from .actions import ActionRunner
-from .buttons import format_combo
+from .buttons import format_combo, label_overrides
 from .combos import ComboEngine
-from .config import PID_PATH, Config, ConfigError, load
+from .config import PID_PATH, Config, ConfigError, load, stamp
 from .devices import DeviceGone, DeviceScanner, Gamepad
 
 
@@ -28,13 +28,21 @@ class Daemon:
         *,
         dry_run: bool = False,
         emit_buttons: bool = True,
+        exit_with_stdin: bool = False,
         stream=None,
     ):
         self.config = config
         self.dry_run = dry_run
         self.emit_buttons = emit_buttons
+        # The shell plugin holds our stdin open. If the shell dies without
+        # stopping us, the pipe closes and we leave too, instead of living on
+        # beside the daemon the next shell starts and firing every press twice.
+        self.exit_with_stdin = exit_with_stdin
         self.stream = stream or sys.stdout
         self.pads: dict[str, Gamepad] = {}
+        # Pads holding each button. Two pads can hold the same one, and it
+        # stays down until the last of them lets go.
+        self._held_by: dict[str, set[str]] = {}
         self.scanner = DeviceScanner()
         self.engine = ComboEngine(config.active_bindings(), config.settings)
         self.runner = ActionRunner(dry_run=dry_run)
@@ -55,6 +63,8 @@ class Daemon:
         self._wake_w = -1
         self._reload_requested = False
         self._last_scan = 0.0
+        # Hand edits to the file are picked up without needing a SIGHUP.
+        self._config_stamp = stamp(config.path)
 
     @property
     def firing(self) -> bool:
@@ -82,6 +92,18 @@ class Daemon:
             exclusive=self.config.exclusive,
             enabled=self.config.enabled,
             paused=self.paused,
+        )
+
+    def emit_bindings(self) -> None:
+        """The whole binding list, so the panel never has to read the file."""
+        layout = self.config.layout
+        self.emit(
+            "bindings",
+            layout=layout,
+            labels=label_overrides(layout),
+            bindings=[
+                {**b.to_dict(), "label": b.label(layout)} for b in self.config.bindings
+            ],
         )
 
     # -- device management --------------------------------------------------
@@ -126,7 +148,6 @@ class Daemon:
                 )
 
         if changed:
-            self.engine.reset()
             self.emit_state()
 
     def _drop_pad(self, path: str, reason: str) -> None:
@@ -135,8 +156,38 @@ class Daemon:
             return
         name = pad.name
         pad.close()
-        self.engine.reset()
-        self.emit("disconnected", path=path, name=name, reason=reason)
+        # Let go of whatever only this pad was holding; another pad's buttons
+        # and any chord in progress on them carry on.
+        for token in [t for t, pads in self._held_by.items() if path in pads]:
+            pads = self._held_by[token]
+            pads.discard(path)
+            if not pads:
+                del self._held_by[token]
+                self.engine.drop(token)
+        self.emit(
+            "disconnected",
+            path=path,
+            name=name,
+            reason=reason,
+            held=sorted(self.engine.held),
+        )
+
+    def _feed(self, path: str, token: str, pressed: bool, now: float):
+        """One pad's button change. None when no button changed overall."""
+        pads = self._held_by.get(token)
+        if pressed:
+            if pads:
+                pads.add(path)
+                return None
+            self._held_by[token] = {path}
+            return self.engine.press(token, now)
+        if not pads or path not in pads:
+            return None
+        pads.discard(path)
+        if pads:
+            return None
+        del self._held_by[token]
+        return self.engine.release(token, now)
 
     # -- config -------------------------------------------------------------
 
@@ -145,6 +196,8 @@ class Daemon:
 
     def _apply_reload(self) -> None:
         self._reload_requested = False
+        # Taken first, so an edit landing mid-load is noticed next time round.
+        self._config_stamp = stamp(self.config.path)
         try:
             new_config = load(self.config.path)
         except ConfigError as exc:
@@ -155,17 +208,36 @@ class Daemon:
         self.config = new_config
         self.engine.set_bindings(new_config.active_bindings(), new_config.settings)
         self.engine.reset()
-        self._warn_about_bad_actions()
-        # Re-open pads when the matching rules or grab mode changed.
+        self._held_by.clear()
+        # Re-open pads when the matching rules or grab mode changed; anything
+        # else (aliases, d-pad source, thresholds) applies to them in place.
         if new_config.exclusive != was_exclusive or new_config.device["match"] != was_match:
             for path in list(self.pads):
                 self._drop_pad(path, "reconfigured")
+        for pad in self.pads.values():
+            pad.apply(new_config.settings, new_config.aliases)
+        # Announced before the warnings below: a client clears old errors on
+        # "reloaded", and these belong to the config just loaded.
         self.emit(
             "reloaded",
             bindings=len(new_config.active_bindings()),
             enabled=new_config.enabled,
         )
+        self.emit_bindings()
+        self._warn_about_bad_actions()
+        self._prepare_keyboard()
         self.rescan()
+
+    def _prepare_keyboard(self) -> None:
+        if not any(b.keys for b in self.config.active_bindings()):
+            return
+        try:
+            self.runner.prepare()
+        except OSError as exc:
+            self.emit(
+                "error",
+                message=f"cannot create the virtual keyboard: {exc}; keys bindings will fail",
+            )
 
     def _warn_about_bad_actions(self) -> None:
         for binding in self.config.active_bindings():
@@ -217,11 +289,9 @@ class Daemon:
             return
 
         for token, pressed in events:
-            activations = (
-                self.engine.press(token, now)
-                if pressed
-                else self.engine.release(token, now)
-            )
+            activations = self._feed(pad.path, token, pressed, now)
+            if activations is None:
+                continue
             # Emitted after the state change, so `held` on a release no longer
             # contains the button that was just let go.
             if self.emit_buttons:
@@ -254,6 +324,15 @@ class Daemon:
         self._open_wakeup_pipe()
         self._install_signal_handlers()
         self._write_pid_file()
+        try:
+            self._loop()
+        finally:
+            # Also on a crash, so the pad is never left grabbed and the
+            # virtual keyboard and pid file do not outlive us.
+            self.shutdown()
+        return 0
+
+    def _loop(self) -> None:
         self.emit(
             "started",
             pid=os.getpid(),
@@ -261,12 +340,14 @@ class Daemon:
             dry_run=self.dry_run,
             enabled=self.config.enabled,
         )
+        self.emit_bindings()
         self._warn_about_bad_actions()
         self.rescan()
         # Always publish an opening snapshot. rescan() only reports when
         # something changed, so a daemon that starts with no pad attached
         # would otherwise leave a client with nothing to render.
         self.emit_state()
+        self._prepare_keyboard()
 
         rescan_interval = self.config.setting("rescan_interval_s")
 
@@ -291,6 +372,8 @@ class Daemon:
             fds = [pad.fileno() for pad in self.pads.values()]
             if self._wake_r >= 0:
                 fds.append(self._wake_r)
+            if self.exit_with_stdin:
+                fds.append(sys.stdin.fileno())
             try:
                 ready, _, _ = select.select(fds, [], [], timeout)
             except InterruptedError:
@@ -304,6 +387,9 @@ class Daemon:
                 if fd == self._wake_r:
                     self._drain_wakeup()
                     continue
+                if self.exit_with_stdin and fd == sys.stdin.fileno():
+                    self._check_stdin()
+                    continue
                 pad = by_fd.get(fd)
                 if pad is not None:
                     self._pump(pad, now)
@@ -311,11 +397,20 @@ class Daemon:
             for activation in self.engine.tick(time.monotonic()):
                 self._fire(activation)
 
+            self.runner.reap()
+
             if time.monotonic() - self._last_scan >= rescan_interval:
+                if stamp(self.config.path) != self._config_stamp:
+                    self._reload_requested = True
                 self.rescan()
 
-        self.shutdown()
-        return 0
+    def _check_stdin(self) -> None:
+        try:
+            data = os.read(sys.stdin.fileno(), 4096)
+        except OSError:
+            data = b""
+        if not data:
+            self.running = False
 
     def _open_wakeup_pipe(self) -> None:
         try:

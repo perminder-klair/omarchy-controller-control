@@ -96,10 +96,56 @@ class TestAmbiguity(unittest.TestCase):
         e.press("L", 0.0)
         self.assertEqual(names(e.tick(0.06)), ["L"])
 
-    def test_chord_broken_before_settling_fires_nothing(self):
+    def test_quick_tap_of_a_chord_prefix_fires_on_release(self):
+        # Let go inside the chord window: still a tap of L, not a lost press.
+        e = engine("L", "L+R")
+        self.assertEqual(names(e.press("L", 0.0)), [])
+        self.assertEqual(names(e.release("L", 0.01)), ["L"])
+        self.assertEqual(names(e.tick(0.5)), [])
+
+    def test_quick_tap_does_not_fire_a_hold_binding(self):
+        e = engine(("SELECT+START", {"hold": True}), "SELECT+START+A")
+        e.press("SELECT", 0.0)
+        e.press("START", 0.01)
+        self.assertEqual(e.release("START", 0.02), [])
+        self.assertEqual(names(e.tick(1.0)), [])
+
+    def test_another_binding_starting_settles_the_waiting_one(self):
+        e = engine("L", "L+R", "A")
+        e.press("L", 0.0)
+        self.assertEqual(names(e.press("A", 0.01)), ["L", "A"])
+
+    def test_unbound_press_keeps_the_waiting_binding(self):
         e = engine("L", "L+R")
         e.press("L", 0.0)
-        e.release("L", 0.01)
+        self.assertEqual(e.press("Z", 0.01), [])
+        self.assertEqual(names(e.tick(0.06)), ["L"])
+
+
+class TestIndependentButtons(unittest.TestCase):
+    def test_held_button_does_not_swallow_another(self):
+        e = engine("A", "L")
+        self.assertEqual(names(e.press("A", 0.0)), ["A"])
+        self.assertEqual(names(e.press("L", 0.3)), ["L"])
+
+    def test_repeat_binding_fires_while_another_button_is_held(self):
+        e = engine("DPAD_LEFT", ("DPAD_UP", {"repeat": True}))
+        e.press("DPAD_LEFT", 0.0)
+        self.assertEqual(names(e.press("DPAD_UP", 0.1)), ["DPAD_UP"])
+        self.assertEqual(names(e.tick(0.4)), ["DPAD_UP"])
+
+    def test_releasing_another_button_keeps_a_repeat_going(self):
+        e = engine("A", ("DPAD_UP", {"repeat": True}))
+        e.press("DPAD_UP", 0.0)
+        e.press("A", 0.1)
+        e.release("A", 0.15)
+        self.assertEqual(names(e.tick(0.3)), ["DPAD_UP"])
+
+    def test_drop_forgets_a_button_without_firing(self):
+        e = engine("L", "L+R")
+        e.press("L", 0.0)
+        e.drop("L")
+        self.assertEqual(e.held, set())
         self.assertEqual(names(e.tick(0.5)), [])
 
 

@@ -57,7 +57,7 @@ CONFIG = {
 class DaemonHarness:
     """Runs the real daemon as a subprocess and collects its JSON events."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, extra_args=(), stdin=None):
         self.dir = tempfile.mkdtemp(prefix="cc-e2e-")
         self.config_path = Path(self.dir) / "config.json"
         self.config_path.write_text(json.dumps(config))
@@ -79,7 +79,9 @@ class DaemonHarness:
                 str(self.config_path),
                 "daemon",
                 "--dry-run",
+                *extra_args,
             ],
+            stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -137,7 +139,7 @@ class DaemonHarness:
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait(timeout=5)
-        for stream in (self.proc.stdout, self.proc.stderr):
+        for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
             if stream is not None:
                 stream.close()
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -150,7 +152,7 @@ class TestDaemonEndToEnd(unittest.TestCase):
         cls.harness.wait_for("started")
         # Daemon is up with no pad present; hotplug one in.
         cls.pad = VirtualPad()
-        cls.harness.wait_for("connected", timeout=8.0)
+        cls.connected = cls.harness.wait_for("connected", timeout=8.0)
 
     @classmethod
     def tearDownClass(cls):
@@ -166,10 +168,8 @@ class TestDaemonEndToEnd(unittest.TestCase):
         return [f["description"] for f in self.harness.fires()]
 
     def test_hotplug_detected_the_pad(self):
-        event = self.harness.wait_for("state", timeout=1.0) if False else None
-        connected = [e for e in self.harness.all if e.get("event") == "connected"]
-        # setUpClass already consumed it; just assert the daemon reports devices.
-        self.assertTrue(connected or True)
+        self.assertEqual(self.connected["name"], NAME)
+        self.assertIn("A", self.connected["buttons"])
 
     def test_single_button_fires_once(self):
         self.pad.tap("A")
@@ -565,3 +565,113 @@ class TestDedicatedBack(unittest.TestCase):
             ("BACK_BUTTON", True), ("BACK_BUTTON", False),
             ("SELECT", True), ("SELECT", False),
         ])
+
+
+class TestTwoPads(unittest.TestCase):
+    """Each pad holds its own buttons; one coming or going leaves the other be."""
+
+    SECOND = NAME + " two"
+
+    def setUp(self):
+        config = {**CONFIG, "settings": {**CONFIG["settings"], "hold_ms": 1500}}
+        self.harness = DaemonHarness(config)
+        self.addCleanup(self.harness.stop)
+        self.harness.wait_for("started")
+        self.first = VirtualPad()
+        self.addCleanup(self.first.close)
+        self.harness.wait_for("connected", name=NAME, timeout=8.0)
+        self.second = VirtualPad(name=self.SECOND)
+        self.addCleanup(self.second.close)
+        self.harness.wait_for("connected", name=self.SECOND, timeout=8.0)
+
+    def test_other_pad_leaving_does_not_cancel_a_hold(self):
+        self.first.press("Y")
+        time.sleep(0.1)
+        self.second.close()
+        self.harness.wait_for("disconnected", name=self.SECOND, timeout=3.0)
+        fire = self.harness.wait_for("fire", description="Hold full", timeout=3.0)
+        self.assertEqual(fire["reason"], "hold")
+        self.first.release("Y")
+
+    def test_button_stays_down_until_both_pads_let_go(self):
+        self.first.press("A")
+        self.harness.wait_for("button", button="A", pressed=True)
+        self.harness.drain()
+        self.second.press("A")
+        self.second.release("A")
+        time.sleep(0.3)
+        self.assertEqual(
+            [e for e in self.harness.all if e.get("event") == "button"], []
+        )
+        self.first.release("A")
+        self.harness.wait_for("button", button="A", pressed=False)
+        self.assertEqual([f["description"] for f in self.harness.fires()], [])
+
+
+class TestConfigFollowsTheFile(unittest.TestCase):
+    def test_hand_edit_is_applied_without_a_signal(self):
+        harness = DaemonHarness(CONFIG)
+        self.addCleanup(harness.stop)
+        first = harness.wait_for("bindings")
+        self.assertEqual(len(first["bindings"]), len(CONFIG["bindings"]))
+        self.assertEqual(first["bindings"][0]["label"], "A")
+        harness.drain()
+
+        edited = {
+            **CONFIG,
+            "bindings": CONFIG["bindings"]
+            + [{"combo": "X", "exec": "true", "description": "Added by hand"}],
+        }
+        staged = harness.config_path.with_suffix(".tmp")
+        staged.write_text(json.dumps(edited))
+        staged.replace(harness.config_path)
+
+        harness.wait_for("reloaded", timeout=3.0)
+        listed = harness.wait_for("bindings", timeout=3.0)
+        self.assertIn("Added by hand", [b.get("description") for b in listed["bindings"]])
+
+
+class TestExitWithStdin(unittest.TestCase):
+    def test_daemon_leaves_when_the_shell_pipe_closes(self):
+        harness = DaemonHarness(
+            CONFIG, extra_args=["--exit-with-stdin"], stdin=subprocess.PIPE
+        )
+        self.addCleanup(harness.stop)
+        harness.wait_for("started")
+        harness.proc.stdin.close()
+        harness.wait_for("stopped", timeout=3.0)
+        self.assertEqual(harness.proc.wait(timeout=3.0), 0)
+
+
+class TestDroppedEvents(unittest.TestCase):
+    """A reader that falls behind loses events; no button may stay stuck down."""
+
+    def test_release_lost_in_an_overflow_is_recovered(self):
+        pad = VirtualPad()
+        self.addCleanup(pad.close)
+        info = next(
+            info for info in DeviceScanner().find_pads([NAME.lower()])
+            if info.name == NAME
+        )
+        reader = Gamepad(info, CONFIG["settings"])
+        self.addCleanup(reader.close)
+
+        pad.press("A")
+        time.sleep(0.05)
+        self.assertEqual(reader.read(), [("A", True)])
+
+        # The release, then far more than the reader's buffer holds, all
+        # before it reads again.
+        pad.release("A")
+        for _ in range(600):
+            pad.press("DPAD_LEFT")
+            pad.release("DPAD_LEFT")
+        time.sleep(0.1)
+
+        held = {"A"}
+        for token, pressed in reader.read():
+            if pressed:
+                held.add(token)
+            else:
+                held.discard(token)
+        self.assertEqual(held, set())

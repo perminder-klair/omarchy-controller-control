@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from .buttons import format_combo, normalize_button, parse_combo
@@ -43,6 +45,19 @@ DEFAULT_SETTINGS: dict = {
     "stick_threshold": 0.65,
     # Seconds between rescans of /dev/input for hotplugged pads.
     "rescan_interval_s": 2.0,
+}
+
+# Smallest (and, for fractions, largest) value each setting accepts. A zero
+# repeat interval would fire on every pass of the loop, and a zero rescan
+# interval would rescan on every pass: both spin a core.
+SETTING_BOUNDS: dict[str, tuple[float, float | None]] = {
+    "combo_window_ms": (0, None),
+    "hold_ms": (1, None),
+    "repeat_delay_ms": (0, None),
+    "repeat_interval_ms": (10, None),
+    "trigger_threshold": (0.01, 1.0),
+    "stick_threshold": (0.01, 1.0),
+    "rescan_interval_s": (0.1, None),
 }
 
 # Where a pad reports its d-pad. Most controllers use the hat axis, which is
@@ -199,8 +214,21 @@ class Config:
         # or dropping the Bluetooth connection.
         self.enabled = bool(raw.get("enabled", True))
 
-        self.device = {**DEFAULT_DEVICE, **(raw.get("device") or {})}
-        self.settings = {**DEFAULT_SETTINGS, **(raw.get("settings") or {})}
+        raw_device = raw.get("device") or {}
+        if not isinstance(raw_device, dict):
+            raise ConfigError("'device' must be an object")
+        raw_settings = raw.get("settings") or {}
+        if not isinstance(raw_settings, dict):
+            raise ConfigError("'settings' must be an object")
+        self.device = {**DEFAULT_DEVICE, **raw_device}
+        self.settings = {**DEFAULT_SETTINGS, **raw_settings}
+        for name, (low, high) in SETTING_BOUNDS.items():
+            value = self.settings[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(f"settings.{name} must be a number")
+            if value < low or (high is not None and value > high):
+                limit = f"between {low} and {high}" if high is not None else f"at least {low}"
+                raise ConfigError(f"settings.{name} must be {limit}")
 
         match = self.device.get("match")
         if isinstance(match, str):
@@ -220,6 +248,8 @@ class Config:
         raw_aliases = self.device.get("aliases") or {}
         if not isinstance(raw_aliases, dict):
             raise ConfigError("device.aliases must be an object")
+        if any(not isinstance(v, str) for v in raw_aliases.values()):
+            raise ConfigError("device.aliases values must be button names")
         aliases = {
             normalize_button(k): normalize_button(v) for k, v in raw_aliases.items()
         }
@@ -337,6 +367,35 @@ def load(path: Path | None = None, *, create: bool = False) -> Config:
         raw = json.loads(target.read_text())
     except json.JSONDecodeError as exc:
         raise ConfigError(f"{target}: invalid JSON: {exc}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"{target}: cannot read: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError(f"{target}: top level must be an object")
     return Config(raw, path=target)
+
+
+def stamp(path: Path) -> tuple | None:
+    """Identity of the file's current contents, to notice it being rewritten."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+@contextmanager
+def editing(path: Path | None = None):
+    """Load the config for a read-change-save, holding a lock throughout.
+
+    The panel runs each edit as its own CLI process. Without the lock, two
+    edits that overlap both read the old file and the second save drops the
+    first edit.
+    """
+    target = Path(path or CONFIG_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target.parent / f".{target.name}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield load(target)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)

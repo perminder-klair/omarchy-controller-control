@@ -30,6 +30,8 @@ EV_ABS = 0x03
 EV_MSC = 0x04
 
 SYN_REPORT = 0
+# The kernel's buffer for this reader overflowed and events were thrown away.
+SYN_DROPPED = 3
 
 # --- button/axis codes we care about ---------------------------------------
 
@@ -68,6 +70,10 @@ def EVIOCGPHYS(length: int) -> int:
 
 def EVIOCGUNIQ(length: int) -> int:
     return _ioc(_IOC_READ, "E", 0x08, length)
+
+
+def EVIOCGKEY(length: int) -> int:
+    return _ioc(_IOC_READ, "E", 0x18, length)
 
 
 def EVIOCGBIT(ev_type: int, length: int) -> int:
@@ -174,6 +180,16 @@ def read_bits(fd: int, ev_type: int, count: int) -> bytes:
     buf = bytearray((count + 7) // 8)
     try:
         fcntl.ioctl(fd, EVIOCGBIT(ev_type, len(buf)), buf)
+    except OSError:
+        return b""
+    return bytes(buf)
+
+
+def read_key_state(fd: int) -> bytes:
+    """Bitmask of the keys and buttons held down right now."""
+    buf = bytearray((KEY_CNT + 7) // 8)
+    try:
+        fcntl.ioctl(fd, EVIOCGKEY(len(buf)), buf)
     except OSError:
         return b""
     return bytes(buf)

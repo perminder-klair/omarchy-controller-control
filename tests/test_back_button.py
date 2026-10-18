@@ -1,15 +1,20 @@
 """Dedicated evdev Back must coexist with legacy Select/Back configurations."""
-import unittest
+
+import sys
 import tempfile
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from engine.buttons import button_for_key_code, parse_combo
-from engine.combos import ComboEngine
-from engine.config import Config, load
-from engine._codes import BTN_CODES
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from engine._codes import BTN_CODES  # noqa: E402
+from engine.buttons import button_for_key_code, parse_combo  # noqa: E402
+from engine.combos import ComboEngine  # noqa: E402
+from engine.config import Config, load  # noqa: E402
 
 
-class DedicatedBackButton(unittest.TestCase):
+class TestDedicatedBackButton(unittest.TestCase):
     def test_evdev_back_and_select_are_distinct(self):
         self.assertEqual(button_for_key_code(BTN_CODES["BACK"]), "BACK_BUTTON")
         self.assertEqual(button_for_key_code(BTN_CODES["SELECT"]), "SELECT")
@@ -29,8 +34,8 @@ class DedicatedBackButton(unittest.TestCase):
         back = button_for_key_code(BTN_CODES["BACK"])
         select = button_for_key_code(BTN_CODES["SELECT"])
         self.assertEqual([a.binding.combo for a in engine.press(back, 0)], [("BACK_BUTTON",)])
-        engine.release(back, .1)
-        self.assertEqual([a.binding.combo for a in engine.press(select, .2)], [("SELECT",)])
+        engine.release(back, 0.1)
+        self.assertEqual([a.binding.combo for a in engine.press(select, 0.2)], [("SELECT",)])
 
     def test_legacy_and_dedicated_bindings_survive_save_and_reload(self):
         config = Config({"bindings": [

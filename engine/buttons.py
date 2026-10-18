@@ -48,6 +48,19 @@ CODE_TO_BUTTON: dict[int, str] = {}
 for _token, _code in GAMEPAD_BUTTONS.items():
     CODE_TO_BUTTON.setdefault(_code, _token)
 
+# Names for every other code, so decoding an event is one lookup. The first
+# name listed wins, except the kernel's range markers: BTN_JOYSTICK and
+# BTN_TRIGGER_HAPPY share a code with the button that opens their range, and
+# that button's own name (TRIGGER, TRIGGER_HAPPY1) is the one a pad means.
+_RANGE_MARKERS = frozenset({"JOYSTICK", "TRIGGER_HAPPY"})
+_BTN_NAMES: dict[int, str] = {}
+for _name, _code in BTN_CODES.items():
+    if _code not in _BTN_NAMES or _BTN_NAMES[_code] in _RANGE_MARKERS:
+        _BTN_NAMES[_code] = _name
+_KEY_NAMES: dict[int, str] = {}
+for _name, _code in KEY_CODES.items():
+    _KEY_NAMES.setdefault(_code, f"KEY_{_name}")
+
 # Aliases accepted in config files, so hand-written configs are forgiving.
 BUTTON_ALIASES: dict[str, str] = {
     "SOUTH": "A",
@@ -77,6 +90,9 @@ BUTTON_ALIASES: dict[str, str] = {
     "DDOWN": "DPAD_DOWN",
     "DLEFT": "DPAD_LEFT",
     "DRIGHT": "DPAD_RIGHT",
+    # Older builds named these after the kernel's range markers.
+    "JOYSTICK": "TRIGGER",
+    "TRIGGER_HAPPY": "TRIGGER_HAPPY1",
 }
 
 # Physical-label overrides for pads that use the Nintendo face layout.
@@ -113,16 +129,17 @@ def normalize_button(token: str) -> str:
 
 def button_for_key_code(code: int) -> str:
     """Name a EV_KEY code coming off a pad or keyboard-mode device."""
-    token = CODE_TO_BUTTON.get(code)
-    if token:
-        return token
-    for name, value in BTN_CODES.items():
-        if value == code:
-            return name
-    for name, value in KEY_CODES.items():
-        if value == code:
-            return f"KEY_{name}"
-    return f"CODE_{code}"
+    return (
+        CODE_TO_BUTTON.get(code)
+        or _BTN_NAMES.get(code)
+        or _KEY_NAMES.get(code)
+        or f"CODE_{code}"
+    )
+
+
+def label_overrides(layout: str) -> dict[str, str]:
+    """Tokens whose label differs from their name under `layout`."""
+    return dict(NINTENDO_LABELS) if layout == "nintendo" else {}
 
 
 def display_label(token: str, layout: str = "auto") -> str:

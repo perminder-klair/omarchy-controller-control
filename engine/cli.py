@@ -14,7 +14,7 @@ from pathlib import Path
 from . import __version__
 from .actions import ActionRunner
 from .buttons import format_combo, parse_combo
-from .config import CONFIG_PATH, PID_PATH, Binding, Config, ConfigError, load
+from .config import CONFIG_PATH, PID_PATH, Binding, Config, ConfigError, editing, load
 from .daemon import Daemon
 from .devices import DeviceGone, Gamepad, find_pads, scan
 from .keys import KeyParseError, parse_keys
@@ -104,10 +104,15 @@ def _notify_daemon(sig: int) -> bool:
         return False
 
 
+def _edit(args):
+    """Load the config for a change that will be saved, locked against others."""
+    return editing(Path(args.config) if args.config else None)
+
+
 def _set_enabled(args, value: bool | None) -> int:
-    config = _load(args)
-    config.enabled = (not config.enabled) if value is None else value
-    config.save()
+    with _edit(args) as config:
+        config.enabled = (not config.enabled) if value is None else value
+        config.save()
     reached = _notify_daemon(signal.SIGHUP)
     state = green("enabled") if config.enabled else yellow("disabled")
     note = (
@@ -168,7 +173,8 @@ def cmd_devices(args) -> int:
         )
         if info.is_gamepad:
             print(f"    buttons: {', '.join(info.button_tokens)}")
-            print(f"    axes:    {', '.join(info.axis_names)}")
+            if info.axis_names:
+                print(f"    axes:    {', '.join(info.axis_names)}")
     return 0
 
 
@@ -306,7 +312,6 @@ def cmd_learn(args) -> int:
 
 
 def cmd_bind(args) -> int:
-    config = _load(args)
     if not args.keys and not args.exec_:
         return fail("give either --keys or --exec")
     if args.keys and args.exec_:
@@ -335,13 +340,19 @@ def cmd_bind(args) -> int:
     if args.hold:
         raw["hold"] = True
 
-    try:
-        binding = Binding(raw, len(config.bindings))
-    except ConfigError as exc:
-        return fail(str(exc))
-
-    replaced = config.upsert(binding)
-    config.save()
+    with _edit(args) as config:
+        existing = config.find(combo)
+        # There is no flag for it, so replacing a binding keeps it switched
+        # off if it was.
+        if existing is not None and not existing.enabled:
+            raw["enabled"] = False
+        try:
+            binding = Binding(raw, len(config.bindings))
+        except ConfigError as exc:
+            return fail(str(exc))
+        replaced = config.upsert(binding)
+        config.save()
+    _notify_daemon(signal.SIGHUP)
     verb = "replaced" if replaced else "added"
     print(
         f"{green(verb)} {bold(binding.label(config.layout))} -> "
@@ -352,14 +363,15 @@ def cmd_bind(args) -> int:
 
 
 def cmd_unbind(args) -> int:
-    config = _load(args)
     try:
         combo = parse_combo(args.combo)
     except ValueError as exc:
         return fail(str(exc))
-    if not config.remove(combo):
-        return fail(f"no binding for {format_combo(combo, config.layout)}")
-    config.save()
+    with _edit(args) as config:
+        if not config.remove(combo):
+            return fail(f"no binding for {format_combo(combo, config.layout)}")
+        config.save()
+    _notify_daemon(signal.SIGHUP)
     print(f"{green('removed')} {bold(format_combo(combo, config.layout))}")
     return 0
 
@@ -446,13 +458,14 @@ def cmd_doctor(args) -> int:
     # sends the d-pad, so this points at the way to find out rather than
     # pretending to detect it.
     source = config.dpad_source
-    print(
-        f" [{dim('info')}] d-pad source is {bold(source)}"
-        + dim(
+    if source == "stick":
+        hint = "  — left-stick events arrive as DPAD_*"
+    else:
+        hint = (
             "  — run 'controller-control monitor' and press the d-pad; if it "
             'reports LSTICK_*, set device.dpad_source to "stick"'
         )
-    )
+    print(f" [{dim('info')}] d-pad source is {bold(source)}" + dim(hint))
     if config.aliases:
         remaps = ", ".join(f"{k}->{v}" for k, v in sorted(config.aliases.items()))
         print(f" [{dim('info')}] aliases: {dim(remaps)}")
@@ -494,6 +507,7 @@ def cmd_daemon(args) -> int:
         config,
         dry_run=args.dry_run,
         emit_buttons=not args.no_buttons,
+        exit_with_stdin=args.exit_with_stdin,
     )
     return daemon.run()
 
@@ -569,6 +583,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("daemon", help="run the listener (used by the shell plugin)")
     p.add_argument("--dry-run", action="store_true", help="log actions, run nothing")
     p.add_argument("--no-buttons", action="store_true", help="omit per-button events")
+    p.add_argument(
+        "--exit-with-stdin",
+        action="store_true",
+        help="exit when stdin closes (the shell plugin holds it open)",
+    )
     p.set_defaults(func=cmd_daemon)
 
     return parser
