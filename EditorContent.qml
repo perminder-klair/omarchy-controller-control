@@ -682,11 +682,11 @@ FocusScope {
     // Text fields and focused buttons keep their normal editing/Tab keys.
     blocked: root.fieldFocused
     onMoveRequested: function (dx, dy) {
-      if (dy !== 0) root.moveCursor(dy)
+      if (dy !== 0 && root.currentTab === "bindings") root.moveCursor(dy)
       else if (dx !== 0) root.currentTab = dx > 0 ? "advanced" : "bindings"
     }
-    onActivateRequested: root.activateCursor()
-    onDeleteRequested: root.deleteAtCursor()
+    onActivateRequested: if (root.currentTab === "bindings") root.activateCursor()
+    onDeleteRequested: if (root.currentTab === "bindings") root.deleteAtCursor()
     onTabRequested: function (direction) {
       if (root.windowMode) root.focusControl(direction)
       else root.switchRequested(direction)
