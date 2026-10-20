@@ -436,18 +436,27 @@ ShellRoot {
           keys.keyClick(Qt.Key_Right)
           check(editor.currentTab === "advanced" && control("advancedPage").visible && !control("bindingsPage").visible, "Right arrow opens the Advanced tab")
           // The binding cursor remains selected when its page is hidden.
-          // x must not delete it, nor Enter open its hidden edit form. The
-          // Python runner also checks the exact fake CLI mutation sequence.
+          // A third binding puts it mid-list, so Down and Up would both move
+          // it. x must not delete it, nor Enter open its hidden edit form.
+          // A deletion shows in the Python runner's exact fake CLI calls.
+          fake.bindings = fake.bindings.concat([{combo: "START", keys: "SUPER+SPACE", description: "Omarchy menu"}])
           keys.keyClick(Qt.Key_Left)
           editor.cursorIndex = -1
           keys.keyClick(Qt.Key_Down)
-          check(editor.cursorIndex === 0, "Keyboard selects a visible binding")
+          keys.keyClick(Qt.Key_Down)
+          keys.keyClick(Qt.Key_Down)
+          keys.keyClick(Qt.Key_Up)
+          check(editor.cursorIndex === 1, "Down and Up move the visible binding cursor")
           keys.keyClick(Qt.Key_Right)
           check(!control("bindingsPage").visible, "Selected binding is hidden on Advanced")
+          keys.keyClick(Qt.Key_Down)
+          check(editor.cursorIndex === 1, "Down on Advanced leaves the hidden binding cursor")
+          keys.keyClick(Qt.Key_Up)
+          check(editor.cursorIndex === 1, "Up on Advanced leaves the hidden binding cursor")
           keys.keyClick(Qt.Key_X)
           keys.keyClick(Qt.Key_Return)
           check(editor.currentTab === "advanced" && editor.draftCombo.length === 0,
-                "Advanced ignores hidden binding activation and deletion")
+                "Enter on Advanced does not edit the hidden binding")
           // The rest of the fixture exercises mode, pointer and profile controls.
           fake._handle(JSON.stringify({event:"bindings", modes:{enabled:true,active:"game"}, bindings:fake.bindings}))
           check(editor.configuredModesEnabled && editor.configuredMode === "game", "Game mode is explicit opt-in")

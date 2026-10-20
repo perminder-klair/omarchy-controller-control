@@ -122,9 +122,10 @@ quietly dropping its `repeat` or `hold`. Anything that goes wrong — a binding
 that failed to run, a config that will not load — shows at the top of the
 panel until you dismiss it.
 
-The panel works from the keyboard too: up and down pick a binding, Enter edits
-it, `x` removes it, `r` records a combo, `t` flips the master switch, left and
-right switch between the tabs, and Esc leaves a text field or closes the panel.
+The panel works from the keyboard too. On the Bindings tab, up and down pick a
+binding, Enter edits it and `x` removes it. On either tab, `r` records a combo,
+`t` flips the master switch, left and right switch between the tabs, and Esc
+leaves a text field or closes the panel.
 
 For an ordinary window with touchscreen-keyboard access, choose **Open window**
 in the panel, or run:
