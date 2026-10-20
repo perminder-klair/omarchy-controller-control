@@ -108,7 +108,7 @@ ShellRoot {
     property var action: null
     property var description: null
     property real savedScroll: 0
-    property real profileWindowWidth: 0
+    property real savedWindowWidth: 0
     function check(ok, message) { if (!ok) throw new Error(message) }
     function find(item, predicate) {
       if (predicate(item)) return item
@@ -481,17 +481,23 @@ ShellRoot {
           fake.running = false
           check(!editor.pointerSaved.enabled && !editor.pointerDirty, "Pointer starts disabled with stable saved assignments")
           panel.openWindow()
-          profileWindowWidth = editor.Window.window.width
-          editor.Window.window.width = 320
+          savedWindowWidth = editor.Window.window.width
+          editor.Window.window.width = editor.Window.window.minimumWidth
         } else if (stage === 21) {
+          check(editor.width < Style.space(420), "Window narrowed below the profile row breakpoint: " + editor.width)
           check(control("profileNameField").visible && control("profileNameField").width >= Style.space(120),
                 "Profile name remains usable at the minimum window width: " + control("profileNameField").width)
-          editor.Window.window.width = profileWindowWidth
+          editor.Window.window.width = savedWindowWidth
           fake.savedPointer = {enabled:false, buttons:{A:"left",X:"left",B:"right"}}
           configurePointer()
           check(editor.pointerDirty && editor.pointerRevision === 0, "Editing shared controls does not write settings")
           editor.refresh()
         } else if (stage === 22) {
+          var profileName = control("profileNameField")
+          check(["copyProfileButton", "renameProfileButton"].every(function(name) {
+            var button = control(name)
+            return button.x >= profileName.x + profileName.width && button.y < profileName.y + profileName.height
+          }), "Profile name and its actions share a row at the default window width")
           check(editor.pointerDirty && editor.pointerDraft.speed === 1450, "Read-only refresh preserves unsaved settings")
           control("resetPointerButton").clicked()
           check(!editor.pointerDirty && !editor.pointerDraft.enabled && editor.pointerLeftToken === "A", "Reset discards edits without saving")

@@ -1347,7 +1347,7 @@ FocusScope {
 
         GridLayout {
           Layout.fillWidth: true
-          columns: root.width < Style.space(460) ? 1 : 3
+          columns: root.width < Style.space(420) ? 1 : 3
           columnSpacing: Style.space(8)
           rowSpacing: Style.space(8)
 
