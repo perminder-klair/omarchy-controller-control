@@ -421,6 +421,14 @@ blocked and acquisition retries automatically. Turning the master switch off
 releases OS grabs; re-enabling waits for neutral before taking ownership again.
 The separate transient capture pause can retain an existing OS grab.
 
+While OS mode holds the grab, other programs that read the controller through
+evdev stop receiving its events. This includes launcher services that watch the
+Home button (`MODE`) directly, such as Omakade's guide button. They see the
+controller again in Game mode. To reach such a program from OS mode, bind the
+button to that program's keyboard shortcut, for example
+`{"combo": "MODE", "keys": "SUPER+CTRL+G"}` to run the Game Mode shortcut that
+Omakade adds to the Hyprland bindings.
+
 Startup, reconnect, configuration/profile reload, pause/resume and input queue overflow
 reset pending chords and close virtual output. Held controls must return to
 neutral before actions resume. Snapshot failures keep output blocked. Sticks
